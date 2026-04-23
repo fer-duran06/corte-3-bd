@@ -14,7 +14,7 @@
 
 **Escenario vulnerable (código que NO usamos):**
 ```javascript
-// ❌ VULNERABLE — concatenación directa del input
+// VULNERABLE — concatenación directa del input
 const query = `SELECT * FROM veterinarios WHERE nombre = '${req.body.nombre}'`;
 ```
 
@@ -33,7 +33,7 @@ La condición `'1'='1'` es siempre verdadera → devuelve todos los registros �
 
 **Cómo lo protegemos:**
 ```javascript
-// ✅ PROTEGIDO — parámetro $1 separado del SQL
+// PROTEGIDO — parámetro $1 separado del SQL
 const result = await client.query(
   'SELECT * FROM veterinarios WHERE nombre = $1',
   [req.body.nombre]
@@ -54,7 +54,7 @@ const schema = z.object({ nombre: z.string().min(1).max(100) });
 
 **Escenario vulnerable (código que NO usamos):**
 ```javascript
-// ❌ VULNERABLE — q se concatena directamente
+// VULNERABLE — q se concatena directamente
 const query = `SELECT id, nombre FROM mascotas WHERE nombre ILIKE '%${req.query.q}%'`;
 ```
 
@@ -74,7 +74,7 @@ La respuesta incluiría cédulas profesionales de los veterinarios mezcladas con
 
 **Cómo lo protegemos:**
 ```javascript
-// ✅ PROTEGIDO — el % se construye en JS, el valor completo va como $1
+// PROTEGIDO — el % se construye en JS, el valor completo va como $1
 const termino = `%${q}%`;
 const result = await client.query(
   'SELECT id, nombre FROM mascotas WHERE nombre ILIKE $1',
@@ -91,7 +91,7 @@ El valor `%' UNION SELECT id, cedula FROM veterinarios --` se busca textualmente
 
 **Escenario vulnerable (código que NO usamos):**
 ```javascript
-// ❌ VULNERABLE
+// VULNERABLE
 const query = `SELECT * FROM mascotas WHERE id = ${req.params.id}`;
 ```
 
@@ -114,7 +114,7 @@ puede extraer información lógica midiendo si la respuesta tarda o no.
 
 **Cómo lo protegemos:**
 ```javascript
-// ✅ PROTEGIDO — id validado como entero por Zod antes de llegar a la query
+// PROTEGIDO — id validado como entero por Zod antes de llegar a la query
 const schema = z.object({ id: z.coerce.number().int().positive() });
 const { id } = schema.parse(req.params);
 
@@ -283,8 +283,8 @@ X-Cache: MISS
 ### Observación en el Frontend
 
 En la pantalla de Vacunación, el banner superior cambia de color según el estado del caché:
-- ⚡ **Verde: "Cache HIT"** — datos servidos desde Redis
-- 🔄 **Naranja: "Cache MISS"** — datos consultados desde PostgreSQL
+- **Verde: "Cache HIT"** — datos servidos desde Redis
+- **Naranja: "Cache MISS"** — datos consultados desde PostgreSQL
 
 Al presionar "Refrescar" repetidamente se observa HIT; al esperar 60 segundos o aplicar una vacuna, el siguiente request muestra MISS.
 

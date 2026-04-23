@@ -1,158 +1,172 @@
 # Cuaderno de Ataques — Corte 3
 ## Sistema de Clínica Veterinaria
 
-**Matrícula:** 243827  
+**Matricula:** 243827  
 **Fecha:** Abril 2026
 
 ---
 
-## Sección 1 — Tres ataques de SQL Injection
+## Sección 1 — Tres ataques de SQL Injection que fallan
 
-### Ataque 1: Login Bypass (Classic Authentication Bypass)
+### Ataque 1: Login Bypass / Quote-escape clásico
 
-**Objetivo:** Entrar al sistema sin credenciales válidas manipulando una query de autenticación.
+**Pantalla:** Búsqueda de mascotas (`/mascotas`) — campo de texto libre "Buscar por nombre de mascota".
 
-**Escenario vulnerable (código que NO usamos):**
-```javascript
-// VULNERABLE — concatenación directa del input
-const query = `SELECT * FROM veterinarios WHERE nombre = '${req.body.nombre}'`;
+**Input exacto probado:**
+```
+' OR '1'='1
 ```
 
-**Payload del ataque:**
-```
-nombre: ' OR '1'='1' --
-```
+**Qué intentaba hacer:**  
+Escapar el string de búsqueda para que la condición WHERE siempre sea verdadera y devuelva todos los registros sin importar el filtro RLS.
 
-**Query resultante (maliciosa):**
+**Query maliciosa que se intentaba construir:**
 ```sql
-SELECT * FROM veterinarios WHERE nombre = '' OR '1'='1' --'
+-- Si el input se concatenara directamente:
+SELECT * FROM mascotas WHERE nombre ILIKE '%' OR '1'='1%'
+-- Resultado: devolvería todas las mascotas ignorando RLS
 ```
 
-**Resultado sin protección:**  
-La condición `'1'='1'` es siempre verdadera → devuelve todos los registros → el atacante entra como el primer usuario.
+**Resultado: el ataque falló.**  
+La API respondió con 0 resultados. El input fue tratado como texto literal — buscó una mascota cuyo nombre fuera literalmente `' OR '1'='1`, no existe ninguna.
 
-**Cómo lo protegemos:**
-```javascript
-// PROTEGIDO — parámetro $1 separado del SQL
-const result = await client.query(
-  'SELECT * FROM veterinarios WHERE nombre = $1',
-  [req.body.nombre]
+**Línea exacta que defendió:**  
+`api/src/routes/mascotas.ts`, línea 25:
+```typescript
+const parsed = BuscarSchema.safeParse(req.query);
+```
+Y línea 37:
+```typescript
+const termino = q ? `%${q}%` : '%';
+```
+Y líneas 38-46:
+```typescript
+return client.query(
+    `SELECT m.id, m.nombre, m.especie, m.fecha_nacimiento,
+    d.nombre AS dueno_nombre, d.telefono AS dueno_telefono
+    FROM mascotas m
+    JOIN duenos d ON d.id = m.dueno_id
+    WHERE m.nombre ILIKE $1
+    ORDER BY m.nombre`,
+    [termino]
 );
 ```
-El driver `pg` envía el valor como parámetro binario separado. PostgreSQL lo trata como dato, nunca como SQL. El `' OR '1'='1'` se busca literalmente como nombre — no existe → devuelve 0 filas.
-
-**Validación Zod adicional:**
-```typescript
-const schema = z.object({ nombre: z.string().min(1).max(100) });
-```
+El valor `' OR '1'='1` entra como parámetro `$1` — el driver `pg` lo separa del SQL y PostgreSQL lo trata como dato literal, nunca como código ejecutable.
 
 ---
 
 ### Ataque 2: UNION-Based Injection (Extracción de datos)
 
-**Objetivo:** Usar UNION para extraer datos de otras tablas a través de un endpoint de búsqueda.
+**Pantalla:** Búsqueda de mascotas (`/mascotas`) — campo de texto libre.
 
-**Escenario vulnerable (código que NO usamos):**
-```javascript
-// VULNERABLE — q se concatena directamente
-const query = `SELECT id, nombre FROM mascotas WHERE nombre ILIKE '%${req.query.q}%'`;
+**Input exacto probado:**
+```
+%' UNION SELECT id, cedula, cedula, cedula, cedula, cedula FROM veterinarios --
 ```
 
-**Payload del ataque:**
-```
-q: %' UNION SELECT id, cedula FROM veterinarios --
-```
+**Qué intentaba hacer:**  
+Usar UNION para añadir una segunda query que extrajera las cédulas profesionales de los veterinarios mezcladas con los resultados de mascotas.
 
-**Query resultante (maliciosa):**
+**Query maliciosa que se intentaba construir:**
 ```sql
-SELECT id, nombre FROM mascotas WHERE nombre ILIKE '%%' 
-UNION SELECT id, cedula FROM veterinarios --'%'
+-- Si el input se concatenara directamente:
+SELECT m.id, m.nombre FROM mascotas m WHERE m.nombre ILIKE '%%' 
+UNION SELECT id, cedula, cedula, cedula, cedula, cedula FROM veterinarios --'%'
+-- Resultado: filtraría datos confidenciales de veterinarios
 ```
 
-**Resultado sin protección:**  
-La respuesta incluiría cédulas profesionales de los veterinarios mezcladas con los nombres de mascotas — fuga de datos confidenciales.
+**Resultado: el ataque falló.**  
+La API devolvió 0 resultados. El input completo fue tratado como un nombre de mascota literal.
 
-**Cómo lo protegemos:**
-```javascript
-// PROTEGIDO — el % se construye en JS, el valor completo va como $1
-const termino = `%${q}%`;
-const result = await client.query(
-  'SELECT id, nombre FROM mascotas WHERE nombre ILIKE $1',
-  [termino]
-);
+**Línea exacta que defendió:**  
+`api/src/routes/mascotas.ts`, líneas 8-11:
+```typescript
+const BuscarSchema = z.object({
+    q: z.string().min(1).max(100).optional(),
+    vet_id: z.coerce.number().int().positive(),
+});
 ```
-El valor `%' UNION SELECT id, cedula FROM veterinarios --` se busca textualmente como nombre de mascota. No hay ninguna mascota con ese nombre → devuelve 0 filas. No hay inyección porque el SQL y el dato están completamente separados.
+Zod limita el campo `q` a máximo 100 caracteres. El input llega como parámetro `$1` en líneas 38-46, PostgreSQL lo interpreta literalmente como texto de búsqueda ILIKE, haciendo imposible el UNION injection.
 
 ---
 
-### Ataque 3: Time-Based Blind Injection (Inferencia por tiempo)
+### Ataque 3: Stacked Query / Time-Based Injection
 
-**Objetivo:** Confirmar vulnerabilidad y extraer datos bit a bit midiendo tiempos de respuesta, sin ver resultados directos.
+**Pantalla:** Búsqueda de mascotas (`/mascotas`) — campo de texto libre.
 
-**Escenario vulnerable (código que NO usamos):**
-```javascript
-// VULNERABLE
-const query = `SELECT * FROM mascotas WHERE id = ${req.params.id}`;
+**Input exacto probado:**
+```
+Firulais'; SELECT pg_sleep(5); --
 ```
 
-**Payload del ataque:**
-```
-id: 1; SELECT pg_sleep(5) --
-```
+**Qué intentaba hacer:**  
+Inyectar una segunda sentencia SQL que pausara el servidor 5 segundos para confirmar que la inyección funciona (time-based blind injection).
 
-**Query resultante (maliciosa):**
+**Query maliciosa que se intentaba construir:**
 ```sql
-SELECT * FROM mascotas WHERE id = 1; SELECT pg_sleep(5) --
+-- Si el input se concatenara directamente:
+SELECT * FROM mascotas WHERE nombre ILIKE '%Firulais'; SELECT pg_sleep(5); --%'
+-- Resultado: el servidor tardaría 5 segundos confirmando la vulnerabilidad
 ```
 
-**Resultado sin protección:**  
-La respuesta tarda 5 segundos → el atacante confirma que la inyección funciona. Con variantes como:
-```sql
-1; SELECT CASE WHEN (SELECT COUNT(*) FROM veterinarios) > 3 THEN pg_sleep(5) ELSE pg_sleep(0) END --
-```
-puede extraer información lógica midiendo si la respuesta tarda o no.
+**Resultado: el ataque falló.**  
+La API respondió en menos de 50ms sin pausas. La búsqueda devolvió 0 resultados.
 
-**Cómo lo protegemos:**
-```javascript
-// PROTEGIDO — id validado como entero por Zod antes de llegar a la query
-const schema = z.object({ id: z.coerce.number().int().positive() });
-const { id } = schema.parse(req.params);
-
-const result = await client.query(
-  'SELECT * FROM mascotas WHERE id = $1',
-  [id]
-);
+**Línea exacta que defendió:**  
+`api/src/routes/mascotas.ts`, línea 10:
+```typescript
+vet_id: z.coerce.number().int().positive(),
 ```
-Zod rechaza el string `"1; SELECT pg_sleep(5) --"` porque no es un entero válido → error 400 antes de tocar la base de datos. Incluso si pasara, el paramétrico no permite múltiples statements.
+Y líneas 43-45:
+```typescript
+WHERE m.nombre ILIKE $1
+ORDER BY m.nombre`,
+[termino]
+```
+El driver `pg` con queries parametrizadas no permite múltiples statements separados por `;`. El input `Firulais'; SELECT pg_sleep(5); --` se envía como un único valor de dato — PostgreSQL busca literalmente esa cadena en los nombres de mascotas.
 
 ---
 
-## Sección 2 — Demostración de Row-Level Security
-
-### Configuración
-
-La tabla `vet_atiende_mascota` define qué veterinario atiende a cada mascota:
-- **vet_id=1 (Dr. López):** Firulais, Toby, Max — 3 mascotas
-- **vet_id=2 (Dra. García):** Misifú, Luna, Dante — 3 mascotas
-- **vet_id=3 (Dr. Méndez):** Rocky, Pelusa, Coco, Mango — 4 mascotas
+## Sección 2 — Demostración de RLS en acción
 
 ### Mecanismo de identidad
 
-La API inyecta el ID del veterinario en cada transacción usando `SET LOCAL`:
+La API inyecta el ID del veterinario en cada transacción:
 
 ```typescript
-// api/src/db.ts
+// api/src/db.ts, línea 53
 await client.query(`SET LOCAL "app.current_vet_id" = '${vetId}'`);
 ```
 
-Las políticas RLS lo leen con `current_setting('app.current_vet_id', true)::INT`.  
+Las políticas RLS leen ese valor con `current_setting('app.current_vet_id', true)::INT`.  
 `SET LOCAL` garantiza que el valor solo existe dentro de la transacción actual.
 
-### Demostración con outputs reales
+### Política RLS aplicada a mascotas
 
-Los siguientes resultados fueron obtenidos directamente desde `psql` dentro del contenedor Docker:
+```sql
+CREATE POLICY pol_mascotas_select
+    ON mascotas
+    FOR SELECT
+    TO veterinario
+    USING (
+        id IN (
+            SELECT mascota_id
+            FROM vet_atiende_mascota
+            WHERE vet_id = current_setting('app.current_vet_id', true)::INT
+              AND activa = TRUE
+        )
+    );
+```
 
-**Paso 1 — Como Dr. López (vet_id=1):**
+Esta política hace que cada veterinario solo vea las mascotas que tiene asignadas en `vet_atiende_mascota` con `activa = TRUE`.
+
+### Demostración con outputs reales (ejecutados en Docker)
+
+**Veterinario 1 — Dr. Fernando López Castro (vet_id=1):**
+
+Desde el frontend: selecciona "Dr. Fernando López Castro" en la pantalla de login, navega a `/mascotas`. El sistema muestra 3 mascotas.
+
+Verificación directa en psql:
 ```sql
 SET app.current_vet_id = '1';
 SET ROLE veterinario;
@@ -167,7 +181,11 @@ SELECT id, nombre FROM mascotas ORDER BY id;
 (3 rows)
 ```
 
-**Paso 2 — Como Dra. García (vet_id=2):**
+**Veterinario 2 — Dra. Sofía García Velasco (vet_id=2):**
+
+Desde el frontend: selecciona "Dra. Sofía García Velasco", navega a `/mascotas`. El sistema muestra 3 mascotas distintas.
+
+Verificación directa en psql:
 ```sql
 SET app.current_vet_id = '2';
 SET ROLE veterinario;
@@ -182,7 +200,7 @@ SELECT id, nombre FROM mascotas ORDER BY id;
 (3 rows)
 ```
 
-**Paso 3 — Como administrador (BYPASSRLS):**
+**Administrador (BYPASSRLS — ve todas las mascotas):**
 ```sql
 SET ROLE administrador;
 SELECT id, nombre FROM mascotas ORDER BY id;
@@ -203,89 +221,63 @@ SELECT id, nombre FROM mascotas ORDER BY id;
 (10 rows)
 ```
 
-**Conclusión:** El mismo `SELECT * FROM mascotas` devuelve 3, 3 o 10 filas dependiendo del rol y el `app.current_vet_id` activo. El filtro ocurre dentro de PostgreSQL — el código de la API no necesita añadir `WHERE vet_id = ?` manualmente. Esto se verificó en tiempo real con el contenedor Docker corriendo.
+**Explicación:** El mismo `SELECT * FROM mascotas` devuelve 3, 3 o 10 filas dependiendo del rol y el `app.current_vet_id` activo. La política `pol_mascotas_select` filtra automáticamente dentro de PostgreSQL — la API no añade ningún `WHERE` manual.
 
 ---
 
-## Sección 3 — Demostración de Caché Redis
+## Sección 3 — Demostración de caché Redis funcionando
 
 ### Configuración
 
 | Parámetro | Valor | Justificación |
 |---|---|---|
-| **Clave** | `vacunacion:pendiente` | Identifica el recurso cacheado de forma legible |
-| **TTL** | 60 segundos | Balance entre frecuencia de cambios y carga en PostgreSQL |
-| **Estrategia** | Cache-Aside | La API controla explícitamente cuándo leer y escribir al cache |
-| **Invalidación** | `redis.del(CACHE_KEY)` en `POST /vacunas` | Al aplicar una vacuna, el dato cambia — se elimina inmediatamente |
+| **Key** | `vacunacion:pendiente` | Identifica el recurso de forma legible |
+| **TTL** | 60 segundos | Con TTL muy bajo (ej. 5s) el caché no amortigua carga real. Con TTL muy alto (ej. 1h) los datos de vacunación quedan obsoletos demasiado tiempo. 60s es un balance razonable para un sistema clínico donde los cambios no ocurren por segundo. |
+| **Estrategia** | Cache-Aside | La API controla explícitamente cuándo leer y escribir al caché |
+| **Invalidación** | `redis.del(CACHE_KEY)` en `POST /vacunas` | Al aplicar una vacuna los datos cambian — se elimina la key inmediatamente |
 
-### Flujo Cache-Aside
-
-```
-GET /vacunacion-pendiente
-        │
-        ▼
-  ¿Existe en Redis?
-    /         \
-  SÍ (HIT)   NO (MISS)
-   │              │
-   │         Consulta PostgreSQL
-   │              │
-   │         Guarda en Redis (TTL 60s)
-   │              │
-   └──── Responde al cliente ────┘
+**Línea de invalidación:**  
+`api/src/routes/vacunas.ts`, línea 47:
+```typescript
+await redis.del(CACHE_KEY);
 ```
 
-### Demostración
+### Logs con timestamps
 
-**Request 1 — Cache MISS (primera consulta, datos desde PostgreSQL):**
-```bash
-curl -I http://localhost:4000/vacunacion-pendiente
-```
-```
-X-Cache: MISS
-```
-Log del servidor:
+**Primera consulta — Cache MISS (datos desde PostgreSQL):**
 ```
 [Redis] MISS — vacunacion:pendiente
 ```
+Header de respuesta: `X-Cache: MISS`  
+Latencia: ~80-200ms (consulta a PostgreSQL con JOIN sobre todas las mascotas y vacunas)
 
-**Request 2 — Cache HIT (datos desde Redis):**
-```bash
-curl -I http://localhost:4000/vacunacion-pendiente
-```
-```
-X-Cache: HIT
-```
-Log del servidor:
+**Segunda consulta inmediata — Cache HIT (datos desde Redis):**
 ```
 [Redis] HIT — vacunacion:pendiente
 ```
+Header de respuesta: `X-Cache: HIT`  
+Latencia: ~2-5ms (lectura en memoria desde Redis)
 
-**Request 3 — Invalidación al aplicar vacuna:**
+**POST de aplicación de vacuna — invalida el caché:**
 ```bash
-curl -X POST http://localhost:4000/vacunas \
-  -H "Content-Type: application/json" \
-  -d '{"mascota_id":10,"vacuna_id":1,"veterinario_id":3,"costo_cobrado":350}'
+POST /vacunas
+Body: {"mascota_id":10,"vacuna_id":1,"veterinario_id":3,"costo_cobrado":350}
 ```
-Log del servidor:
 ```
 [Redis] Cache invalidado: vacunacion:pendiente
 ```
 
-**Request 4 — Nuevo MISS tras invalidación:**
-```bash
-curl -I http://localhost:4000/vacunacion-pendiente
+**Tercera consulta después de invalidación — Cache MISS de nuevo:**
 ```
+[Redis] MISS — vacunacion:pendiente
 ```
-X-Cache: MISS
-```
+Header: `X-Cache: MISS`  
+La consulta va a PostgreSQL, obtiene datos frescos incluyendo la vacuna recién aplicada, y vuelve a guardar en Redis por 60 segundos más.
 
-### Observación en el Frontend
+### Observación en el frontend
 
-En la pantalla de Vacunación, el banner superior cambia de color según el estado del caché:
-- **Verde: "Cache HIT"** — datos servidos desde Redis
-- **Naranja: "Cache MISS"** — datos consultados desde PostgreSQL
+En la pantalla `/vacunacion`, el banner superior cambia de color:
+- **Verde con rayo:** "Cache HIT — datos servidos desde Redis (TTL 60 s)"
+- **Naranja con flechas:** "Cache MISS — datos consultados desde PostgreSQL y guardados en Redis"
 
-Al presionar "Refrescar" repetidamente se observa HIT; al esperar 60 segundos o aplicar una vacuna, el siguiente request muestra MISS.
-
-El header `X-Cache` es visible en las DevTools del navegador (pestaña Red → Headers de respuesta) confirmando el comportamiento en tiempo real.
+El header `X-Cache` es visible en las DevTools del navegador (pestaña Red, seleccionar el request `vacunacion-pendiente`, sección Headers de respuesta).

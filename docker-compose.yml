@@ -1,0 +1,32 @@
+services:
+  db:
+    image: postgres:16
+    container_name: clinica_vet_db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./backend/schema_corte3.sql:/docker-entrypoint-initdb.d/00_schema.sql
+      - ./backend/01_procedures.sql:/docker-entrypoint-initdb.d/01_procedures.sql
+      - ./backend/02_triggers.sql:/docker-entrypoint-initdb.d/02_triggers.sql
+      - ./backend/03_views.sql:/docker-entrypoint-initdb.d/03_views.sql
+      - ./backend/04_roles_y_permisos.sql:/docker-entrypoint-initdb.d/04_roles_y_permisos.sql
+      - ./backend/05_rls.sql:/docker-entrypoint-initdb.d/05_rls.sql
+
+  redis:
+    image: redis:7-alpine
+    container_name: clinica_vet_redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+
+volumes:
+  postgres_data:
+  redis_data:

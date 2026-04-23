@@ -26,8 +26,8 @@ npm run dev      # http://localhost:3000
 Antes de correr la API, asegúrate de tener un archivo `api/.env` con:
 
 ```
-DATABASE_URL=postgresql://postgres:<tu_password>@localhost:5432/clinica_vet
-REDIS_URL=redis://localhost:6379
+DATABASE_URL=postgresql://postgres:<tu_password>@127.0.0.1:5432/clinica_vet
+REDIS_URL=redis://127.0.0.1:6379
 PORT=4000
 CORS_ORIGIN=http://localhost:3000
 ```
@@ -54,12 +54,32 @@ Se usa el mecanismo de **variables de sesión de PostgreSQL** (`SET LOCAL`):
 
 ```sql
 -- Dentro de cada transacción, antes de cualquier query:
-SET LOCAL app.current_vet_id = '1';
+SET LOCAL "app.current_vet_id" = '1';
 ```
 
 Las políticas RLS leen ese valor con `current_setting('app.current_vet_id', true)::INT`. El segundo argumento `true` evita error si la variable no se ha seteado (devuelve NULL). `SET LOCAL` asegura que el valor solo existe dentro de la transacción actual — cuando se hace COMMIT o ROLLBACK, el valor desaparece.
 
-En la API esto se implementa en `src/db.ts` mediante la función `withVetContext(vetId, fn)` que abre una transacción, ejecuta el SET LOCAL, corre el callback, y hace COMMIT/ROLLBACK automáticamente.
+En la API esto se implementa en `src/db.ts` mediante la función `withVetContext(vetId, fn)` que abre una transacción, ejecuta el `SET LOCAL`, corre el callback, y hace COMMIT/ROLLBACK automáticamente.
+
+**Vector de ataque posible y cómo se previene:**
+
+PostgreSQL no acepta parámetros `$1` en `SET LOCAL`, por lo que el valor se inyecta con interpolación de string:
+
+```typescript
+// api/src/db.ts, línea 53
+await client.query(`SET LOCAL "app.current_vet_id" = '${vetId}'`);
+```
+
+El vector de ataque es que si `vetId` fuera un string no validado, un atacante podría enviar `vet_id=1'; SET LOCAL "app.current_vet_id" = '2` y suplantar la identidad de otro veterinario, saltándose el RLS.
+
+**El sistema lo previene** mediante validación estricta con Zod antes de que el valor llegue a `withVetContext`:
+
+```typescript
+// api/src/routes/mascotas.ts, línea 10
+vet_id: z.coerce.number().int().positive(),
+```
+
+Zod convierte el input a número entero positivo. Si el valor no es un entero válido (ej. `1'; SET LOCAL...`), la validación falla con error 400 y nunca llega a la query. Un número entero no puede contener comillas ni punto y coma, eliminando completamente el vector de inyección.
 
 ### 3. ¿Cómo protegiste la capa HTTP contra SQL Injection?
 
@@ -76,8 +96,8 @@ Tres capas de defensa:
 | Decisión | Valor | Razón |
 |---|---|---|
 | **Clave** | `vacunacion:pendiente` | Identifica el recurso cacheado de forma legible |
-| **TTL** | 60 segundos | Balance entre frecuencia de cambios y carga en PostgreSQL |
-| **Estrategia** | **Cache-Aside** | La API controla explícitamente cuándo leer y escribir al cache |
+| **TTL** | 60 segundos | Con TTL muy bajo (ej. 5s) el caché no amortigua carga real. Con TTL muy alto (ej. 1h) los datos de vacunación quedan obsoletos demasiado tiempo. 60s es un balance razonable para un sistema clínico donde los cambios no ocurren por segundo. |
+| **Estrategia** | Cache-Aside | La API controla explícitamente cuándo leer y escribir al cache |
 | **Invalidación** | `redis.del(CACHE_KEY)` en `POST /vacunas` | Al aplicar una vacuna, el dato cambia — se elimina inmediatamente para que el próximo GET traiga datos frescos |
 
 El flujo Cache-Aside: en cada `GET /vacunacion-pendiente` se busca primero en Redis. Si existe (HIT) se devuelve el JSON cacheado. Si no (MISS) se consulta PostgreSQL, se guarda en Redis con TTL y se responde. El header `X-Cache: HIT/MISS` permite observar el comportamiento desde el frontend.
@@ -93,4 +113,5 @@ El flujo Cache-Aside: en cada `GET /vacunacion-pendiente` se busca primero en Re
 
 - **RLS en tres tablas**: `mascotas`, `vacunas_aplicadas` y `citas`. Se eligieron estas porque contienen datos clínico-sensibles. `inventario_vacunas` y `duenos` no tienen RLS porque recepción y veterinarios necesitan verlos completos.  
 - **FORCE ROW LEVEL SECURITY**: se añadió `FORCE RLS` para que el propietario de la tabla (superuser) también pase por las políticas en sus roles descendientes.  
-- **Política separada para recepción en mascotas y citas**: la recepción puede ver todas las mascotas (para agendar citas) pero las políticas del veterinario solo aplican al rol `veterinario`.
+- **Política separada para recepción en mascotas y citas**: la recepción puede ver todas las mascotas (para agendar citas) pero las políticas del veterinario solo aplican al rol `veterinario`.  
+- **No se usó SECURITY DEFINER**: los procedures (`sp_agendar_cita`, `fn_total_facturado`) se ejecutan con los permisos del usuario que los llama, no con los del propietario. Esto evita el vector de escalada de privilegios por manipulación del `search_path` que habilitaría `SECURITY DEFINER`. Como los procedures no necesitan acceder a objetos fuera del alcance del rol llamante, `SECURITY DEFINER` no era necesario.
